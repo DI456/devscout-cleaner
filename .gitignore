@@ -1,0 +1,8 @@
+/target/
+*.reg
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
