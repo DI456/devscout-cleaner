@@ -401,10 +401,17 @@ fn show_error(message: &str) {
 }
 
 fn normalize_path(path: &Path) -> String {
-    path.to_string_lossy()
+    let value = path
+        .to_string_lossy()
         .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_ascii_lowercase()
+        .to_ascii_lowercase();
+    let value = value
+        .strip_prefix("\\\\?\\unc\\")
+        .map(|rest| format!("\\\\{rest}"))
+        .or_else(|| value.strip_prefix("\\\\?\\").map(str::to_string))
+        .or_else(|| value.strip_prefix("\\\\.\\").map(str::to_string))
+        .unwrap_or(value);
+    value.trim_end_matches('\\').to_string()
 }
 
 fn is_protected_directory(path: &Path) -> bool {
@@ -698,16 +705,20 @@ fn classify_registry_reference(
     name: &str,
     value: &str,
     target: &str,
-) -> (bool, bool) {
-    if !path_reference_matches(value, target) {
-        return (false, false);
+) -> (bool, bool, bool) {
+    let value_matches = path_reference_matches(value, target);
+    let name_matches = path_reference_matches(name, target);
+    if !value_matches && !name_matches {
+        return (false, false, false);
     }
     let value_name = name.to_ascii_lowercase();
-    let certain = value_name == "installlocation" && normalize_path(Path::new(value)) == target
-        || value_name == "uninstallstring"
-        || value_name == "quietuninstallstring"
-        || (category.starts_with("App Paths") && (value_name.is_empty() || value_name == "path"));
-    (true, certain)
+    let certain = value_matches
+        && (value_name == "installlocation" && normalize_path(Path::new(value)) == target
+            || value_name == "uninstallstring"
+            || value_name == "quietuninstallstring"
+            || (category.starts_with("App Paths")
+                && (value_name.is_empty() || value_name == "path")));
+    (true, certain, name_matches)
 }
 
 fn target_signals(target: &Path) -> Vec<String> {
@@ -771,7 +782,7 @@ fn scan_registry_location(
     scanned: &mut u64,
     progress: &mut dyn FnMut(u64),
 ) -> Vec<RegistryCandidate> {
-    let depth = if category == "软件键路径引用" {
+    let depth = if category == "软件键路径引用" || category == "应用程序注册" {
         4
     } else {
         1
@@ -800,11 +811,13 @@ fn scan_registry_location(
             if name.eq_ignore_ascii_case("DisplayName") && !value.is_empty() {
                 display_name = value.clone();
             }
-            let (matched, is_certain) =
+            let (matched, is_certain, matched_in_name) =
                 classify_registry_reference(category, name, value, target_norm);
             if matched {
                 certain |= is_certain;
-                reasons.push(if is_certain {
+                reasons.push(if matched_in_name && !is_certain {
+                    format!("{name} 注册表值名称包含目标目录")
+                } else if is_certain {
                     format!("{name} 强匹配目标目录")
                 } else {
                     format!("{name} 路径引用目标目录")
@@ -911,6 +924,54 @@ fn scan_registry_for_target_with_progress(
             "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths",
             KEY_WOW64_32KEY,
             "App Paths 程序路径",
+        ),
+        (
+            HKCU,
+            "Software\\Classes\\Applications",
+            KEY_WOW64_64KEY,
+            "应用程序注册",
+        ),
+        (
+            HKCU,
+            "Software\\Classes\\Applications",
+            KEY_WOW64_32KEY,
+            "应用程序注册",
+        ),
+        (
+            HKLM,
+            "Software\\Classes\\Applications",
+            KEY_WOW64_64KEY,
+            "应用程序注册",
+        ),
+        (
+            HKLM,
+            "Software\\Classes\\Applications",
+            KEY_WOW64_32KEY,
+            "应用程序注册",
+        ),
+        (
+            HKCU,
+            "Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell",
+            KEY_WOW64_64KEY,
+            "Windows Shell 路径缓存",
+        ),
+        (
+            HKCU,
+            "Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell",
+            KEY_WOW64_32KEY,
+            "Windows Shell 路径缓存",
+        ),
+        (
+            HKLM,
+            "Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell",
+            KEY_WOW64_64KEY,
+            "Windows Shell 路径缓存",
+        ),
+        (
+            HKLM,
+            "Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell",
+            KEY_WOW64_32KEY,
+            "Windows Shell 路径缓存",
         ),
         (HKCU, "Software", KEY_WOW64_64KEY, "软件键路径引用"),
         (HKCU, "Software", KEY_WOW64_32KEY, "软件键路径引用"),
@@ -2132,11 +2193,36 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_windows_extended_paths() {
+        assert_eq!(
+            normalize_path(Path::new("\\\\?\\D:\\office\\IDEA_2023.3.6_Protable\\")),
+            "d:\\office\\idea_2023.3.6_protable"
+        );
+        assert!(path_reference_matches(
+            "\\\\?\\D:\\office\\IDEA_2023.3.6_Protable\\bin\\idea64.exe",
+            "d:\\office\\idea_2023.3.6_protable"
+        ));
+    }
+
+    #[test]
     fn rejects_similar_prefix() {
         assert!(!path_reference_matches(
             "D:\\toss pc\\QuarkCloudDriveBackup\\unins000.exe",
             "d:\\toss pc\\quarkclouddrive"
         ));
+    }
+
+    #[test]
+    fn matches_path_in_registry_value_name() {
+        let (matched, certain, matched_in_name) = classify_registry_reference(
+            "Windows Shell 路径缓存",
+            "D:\\office\\IDEA_2023.3.6_Protable\\bin\\idea64.exe.FriendlyAppName",
+            "IntelliJ IDEA",
+            "d:\\office\\idea_2023.3.6_protable",
+        );
+        assert!(matched);
+        assert!(!certain);
+        assert!(matched_in_name);
     }
 
     #[test]
@@ -2156,10 +2242,23 @@ mod tests {
     fn discovers_quark_install_record_when_present() {
         let target = Path::new("D:\\toss pc\\QuarkCloudDrive");
         if target.is_dir() {
-            let candidates = scan_registry_for_target(target);
+            let candidates = scan_registry_for_target(&target);
             assert!(candidates.iter().any(|candidate| {
                 candidate.reason.contains("InstallLocation")
                     && candidate.display_name.contains("夸克网盘")
+            }));
+        }
+    }
+
+    #[test]
+    #[ignore = "需要本机存在便携版 IDEA，仅用于本地回归验证"]
+    fn discovers_portable_idea_shell_cache() {
+        if Path::new("D:\\office\\IDEA_2023.3.6_Protable").is_dir() {
+            let target = validate_target("D:\\office\\IDEA_2023.3.6_Protable").unwrap();
+            let candidates = scan_registry_for_target(&target);
+            assert!(candidates.iter().any(|candidate| {
+                candidate.sub_key.ends_with("\\MuiCache")
+                    && candidate.reason.contains("注册表值名称包含目标目录")
             }));
         }
     }
